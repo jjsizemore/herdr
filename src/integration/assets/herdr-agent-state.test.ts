@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -591,6 +591,79 @@ test("Oh My Pi keeps working when a turn ends with a scheduled continuation", as
   await waitFor(() => requestStates(requests).length === 3);
   expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
 });
+
+test("Oh My Pi explicitly releases a deliberately quit conversation", async () => {
+  const requests = await startRecordingServer("omp-quit");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    isIdle: () => true,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-quit.jsonl",
+      getSessionId: () => "omp-quit",
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+  await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, context);
+
+  const release = requests.at(-1);
+  expect(release).toMatchObject({
+    method: "pane.release_agent",
+    params: { pane_id: "test:p1", source: "herdr:omp", agent: "omp" },
+  });
+  if (!isRecord(release) || !isRecord(release.params)) {
+    throw new Error("missing release parameters");
+  }
+  const previous = requests.at(-2);
+  if (
+    !isRecord(previous) ||
+    !isRecord(previous.params) ||
+    typeof release.params.seq !== "number" ||
+    typeof previous.params.seq !== "number"
+  ) {
+    throw new Error("missing sequenced state report");
+  }
+  expect(release.params.seq).toBeGreaterThan(previous.params.seq);
+});
+
+for (const reason of ["signal", "fatal", "dispose", "legacy", "undefined"] as const) {
+  test(`Oh My Pi preserves ${reason} shutdown and cancels pending idle`, async () => {
+    const requests = await startRecordingServer(`omp-${reason}`);
+    process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "30";
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+    install(pi);
+    const context = {
+      hasUI: true,
+      isIdle: () => false,
+      sessionManager: {
+        getSessionFile: () => `/tmp/omp-${reason}.jsonl`,
+        getSessionId: () => `omp-${reason}`,
+      },
+    };
+    handlers.get("session_start")?.({ reason: "startup" }, context);
+    await waitFor(() => requestStates(requests).length === 1);
+    vi.useFakeTimers();
+    try {
+      handlers.get("agent_end")?.({ messages: [] }, context);
+      const event = reason === "undefined" ? undefined
+        : reason === "legacy" ? { type: "session_shutdown" }
+        : { type: "session_shutdown", reason };
+      await handlers.get("session_shutdown")?.(event, context);
+      vi.advanceTimersByTime(60);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(requestStates(requests)).toEqual(["working"]);
+    expect(
+      requests.some((request) => isRecord(request) && request.method === "pane.release_agent"),
+    ).toBe(false);
+  });
+}
 
 test("Pi retries working state after an unanswered socket attempt", async () => {
   const { attemptedRequests, deliveredRequests, connectionCount } =

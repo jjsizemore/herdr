@@ -1607,7 +1607,12 @@ impl AppState {
                 seq,
                 ..
             } => {
-                if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
+                // OMP reports deliberate quit explicitly; its interrupted process
+                // exits retain the native reference. Other official integrations
+                // still leave release to process detection.
+                if crate::agent_resume::is_official_agent_source(&source, &agent_label)
+                    && (source.as_str(), agent_label.as_str()) != ("herdr:omp", "omp")
+                {
                     Vec::new()
                 } else {
                     self.update_terminal_state(pane_id, |terminal| {
@@ -4032,6 +4037,79 @@ mod tests {
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.full_lifecycle_hook_authority_active());
         assert!(!state.session_dirty);
+    }
+
+    #[test]
+    fn omp_explicit_release_forgets_restore_reference_before_or_after_process_exit() {
+        for process_exited in [false, true] {
+            let mut state = app_with_workspaces(&["active"]);
+            let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Working);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("omp-release.jsonl")
+                        .display()
+                        .to_string(),
+                )
+                .unwrap(),
+            });
+            let session_ref = terminal
+                .persisted_agent_session
+                .as_ref()
+                .unwrap()
+                .session_ref
+                .clone();
+            terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:omp".into(),
+                    "omp".into(),
+                    AgentState::Working,
+                    None,
+                    Some(session_ref),
+                    Some(1),
+                )
+                .expect("OMP lifecycle report should acquire authority");
+            if process_exited {
+                state.handle_app_event(AppEvent::StateChanged {
+                    pane_id,
+                    agent: Some(Agent::Omp),
+                    state: AgentState::Idle,
+                    visible_blocker: false,
+                    visible_working: false,
+                    process_exited: true,
+                    observed_at: std::time::Instant::now(),
+                });
+            }
+            let terminal = &state.terminals[&terminal_id];
+            assert!(
+                terminal.persisted_agent_session.is_some()
+                    || terminal
+                        .hook_authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.session_ref.is_some())
+            );
+            state.session_dirty = false;
+            state.handle_app_event(AppEvent::HookAgentReleased {
+                pane_id,
+                source: "herdr:omp".into(),
+                agent_label: "omp".into(),
+                known_agent: Some(Agent::Omp),
+                seq: Some(2),
+            });
+            assert!(state.terminals[&terminal_id]
+                .persisted_agent_session
+                .is_none());
+            assert!(!state.terminals[&terminal_id].full_lifecycle_hook_authority_active());
+            assert!(state.session_dirty);
+        }
     }
 
     #[test]

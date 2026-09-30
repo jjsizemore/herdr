@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -463,9 +463,25 @@ export default function (pi) {
     scheduleIdle();
   });
 
-  pi.on("session_shutdown", () => {
-    if (rootSession) {
-      clearPendingTimers();
+  pi.on("session_shutdown", async (event) => {
+    if (!rootSession) {
+      return;
+    }
+    clearPendingTimers();
+    // Only explicit user exit forgets a conversation. Signals, disposal, and
+    // legacy payload-free shutdown events must remain resumable when they
+    // precede Herdr's shutdown checkpoint.
+    if (event?.reason === "quit") {
+      await sendRequest({
+        id: `${source}:release:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        method: "pane.release_agent",
+        params: {
+          pane_id: paneId,
+          source,
+          agent: "omp",
+          seq: nextReportSeq(),
+        },
+      });
     }
   });
 }

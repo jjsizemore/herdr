@@ -529,12 +529,12 @@ impl TerminalState {
                             })
                     })
                 });
-            if let Some((source, agent_label, session_ref)) = official_session {
-                self.hook_report_sequences.remove(&source);
+            if let Some((source, agent_label, session_ref)) = &official_session {
+                self.hook_report_sequences.remove(source);
                 self.suppress_full_lifecycle_hook_report_with_session_ref(
-                    source,
-                    agent_label,
-                    session_ref,
+                    source.clone(),
+                    agent_label.clone(),
+                    session_ref.clone(),
                     FullLifecycleHookSuppressionReason::ProcessExit,
                     now,
                 );
@@ -548,7 +548,23 @@ impl TerminalState {
                 self.hook_report_sequences.remove(&source);
                 self.hook_authority = None;
             }
-            if !newer_custom_authority
+            let retained_omp_session = if newer_custom_authority {
+                None
+            } else {
+                official_session.and_then(|(source, agent_label, session_ref)| {
+                    if (source.as_str(), agent_label.as_str()) != ("herdr:omp", "omp") {
+                        return None;
+                    }
+                    session_ref.map(|session_ref| crate::agent_resume::PersistedAgentSession {
+                        source,
+                        agent: agent_label,
+                        session_ref,
+                    })
+                })
+            };
+            if let Some(session) = retained_omp_session {
+                self.persisted_agent_session = Some(session);
+            } else if !newer_custom_authority
                 && self
                     .persisted_agent_session
                     .as_ref()
@@ -6435,5 +6451,235 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    #[test]
+    fn omp_process_exit_retains_native_session_ref_for_resume() {
+        let mut terminal = test_terminal();
+        let session_path = test_session_path("omp-interrupted.jsonl");
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Omp,
+            "herdr:omp",
+            "omp",
+            crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+        );
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(session_path.clone()),
+                Some(1),
+            )
+            .expect("omp hook authority should be acquired before exit");
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Omp),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal.persisted_agent_session.as_ref().map(|session| (
+                session.source.as_str(),
+                session.agent.as_str(),
+                session.session_ref.value.as_str()
+            )),
+            Some(("herdr:omp", "omp", session_path.as_str()))
+        );
+
+        // A delayed report carrying the exited generation must not reacquire.
+        let late = terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(session_path.clone()),
+            Some(2),
+        );
+        assert!(late.is_none());
+        assert!(terminal.hook_authority.is_none());
+        assert!(terminal.persisted_agent_session.is_some());
+    }
+
+    #[test]
+    fn omp_release_after_process_exit_forgets_retained_session_ref() {
+        let mut terminal = test_terminal();
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Omp,
+            "herdr:omp",
+            "omp",
+            crate::agent_resume::AgentSessionRef::id("omp-session").unwrap(),
+        );
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::id("omp-session"),
+                Some(1),
+            )
+            .expect("omp hook authority should be acquired before exit");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Omp),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert!(terminal.persisted_agent_session.is_some());
+
+        let mutation = terminal
+            .release_agent_with_mutation("herdr:omp", "omp", Some(2))
+            .expect("explicit release must clear the retained ref");
+
+        assert!(mutation.session_ref_changed);
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.hook_authority.is_none());
+    }
+
+    #[test]
+    fn omp_retained_session_yields_to_different_live_agent() {
+        let mut terminal = test_terminal();
+        let omp_session = test_session_path("omp-superseded.jsonl");
+        let pi_session = test_session_path("pi-superseding.jsonl");
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Omp,
+            "herdr:omp",
+            "omp",
+            crate::agent_resume::AgentSessionRef::path(omp_session.clone()).unwrap(),
+        );
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(omp_session.clone()),
+                Some(1),
+            )
+            .expect("omp hook authority should be acquired before exit");
+        let exit_at = Instant::now();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Omp),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            exit_at,
+        );
+        assert!(terminal.persisted_agent_session.is_some());
+
+        // A new live agent in the same pane supersedes the retained OMP identity.
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            exit_at + Duration::from_millis(1),
+        );
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::path(pi_session.clone()),
+                Some(400),
+                Some("startup".into()),
+            )
+            .expect("fresh live agent must supersede the retained OMP session");
+        assert_eq!(
+            terminal.persisted_agent_session.as_ref().map(|session| (
+                session.source.as_str(),
+                session.agent.as_str(),
+                session.session_ref.value.as_str()
+            )),
+            Some(("herdr:pi", "pi", pi_session.as_str()))
+        );
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(pi_session),
+                Some(401),
+            )
+            .expect("replacement agent reports must be accepted");
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .map(|authority| authority.agent_label.as_str()),
+            Some("pi")
+        );
+
+        // The superseded OMP generation must not reclaim the pane.
+        let stale_omp = terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(omp_session),
+            Some(500),
+        );
+        assert!(stale_omp.is_none());
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .map(|authority| authority.agent_label.as_str()),
+            Some("pi")
+        );
+    }
+
+    #[test]
+    fn pi_hook_authority_process_exit_still_clears_session_ref() {
+        let mut terminal = test_terminal();
+        let session_path = test_session_path("pi-exit.jsonl");
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Pi,
+            "herdr:pi",
+            "pi",
+            crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+        );
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(session_path),
+                Some(1),
+            )
+            .expect("pi hook authority should be acquired before exit");
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+
+        assert!(terminal.hook_authority.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
     }
 }

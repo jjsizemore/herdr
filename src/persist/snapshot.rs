@@ -671,6 +671,23 @@ mod tests {
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
     }
+    fn anchor_full_lifecycle_session_for_snapshot(
+        state: &mut crate::app::AppState,
+        terminal_id: &crate::terminal::TerminalId,
+        session_path: &str,
+    ) {
+        let terminal = state.terminals.get_mut(terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Omp),
+            crate::detect::AgentState::Working,
+        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(session_path.to_string())
+                .unwrap(),
+        });
+    }
 
     #[test]
     fn round_trip_layout_snapshot() {
@@ -1260,6 +1277,46 @@ mod tests {
 
         assert!(first_history.ansi.contains("first-pane-history"));
         assert!(second_history.ansi.contains("second-pane-history"));
+    }
+
+    #[test]
+    fn capture_contract_preserves_omp_session_after_interruption() {
+        let mut state = state_with_workspaces(&["one"]);
+        let session_path = test_session_path("interrupted-omp.jsonl");
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        anchor_full_lifecycle_session_for_snapshot(&mut state, &terminal_id, &session_path);
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::detect::AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(session_path.clone()),
+                Some(2),
+            )
+            .expect("omp hook authority should be acquired before exit");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Omp),
+            crate::detect::AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            std::time::Instant::now(),
+        );
+
+        let snapshot = capture_from_state(&state);
+        let session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("interrupted OMP conversation must remain resumable");
+        assert_eq!(session.source, "herdr:omp");
+        assert_eq!(session.value, session_path);
     }
 
     #[test]

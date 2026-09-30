@@ -3209,12 +3209,10 @@ fn bundled_integration_asset_versions_match_expected_versions() {
         );
     }
 }
-
 #[test]
-fn process_owned_integration_assets_do_not_report_release() {
+fn process_owned_integration_assets_do_not_report_unconditional_release() {
     for (name, asset) in [
         ("pi", PI_EXTENSION_ASSET),
-        ("omp", OMP_EXTENSION_ASSET),
         ("mastracode", MASTRACODE_HOOK_ASSET),
         ("kimi", KIMI_HOOK_ASSET),
         ("kilo", KILO_PLUGIN_ASSET),
@@ -3225,6 +3223,26 @@ fn process_owned_integration_assets_do_not_report_release() {
             "{name} process exit should own lifecycle release"
         );
     }
+
+    let omp_release = OMP_EXTENSION_ASSET
+        .find("pane.release_agent")
+        .expect("OMP deliberate quit must release");
+    let prefix = &OMP_EXTENSION_ASSET[..omp_release];
+    let governing_check = prefix
+        .rfind("event?.reason === \"quit\"")
+        .expect("OMP release must be guarded by explicit quit intent");
+    let gap =
+        &OMP_EXTENSION_ASSET[governing_check + "event?.reason === \"quit\"".len()..omp_release];
+    let stripped: String = gap
+        .chars()
+        .filter(|candidate| !candidate.is_whitespace())
+        .collect();
+    assert!(
+        stripped.len() < 400
+            && !stripped.contains("pane.report_agent")
+            && !stripped.contains("clearPendingTimers();}"),
+        "OMP release must remain adjacent to the explicit quit check"
+    );
 }
 
 #[test]
